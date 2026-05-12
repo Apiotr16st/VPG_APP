@@ -1,23 +1,96 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import signal, fft
+from scipy import signal
 import datetime
 import os
 import time
 
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision
+
 # --- 1. KONFIGURACJA I INICJALIZACJA ---
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FACE_LANDMARKER_MODEL = os.path.join(BASE_DIR, "face_landmarker.task")
+
+if not os.path.exists(FACE_LANDMARKER_MODEL):
+    raise SystemExit(
+        "Brakuje modelu 'face_landmarker.task'. Pobierz model Face Landmarker "
+        f"i zapisz go w katalogu projektu: {BASE_DIR}"
+    )
+
+face_landmarker = vision.FaceLandmarker.create_from_options(
+    vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+)
 
 cap = cv2.VideoCapture(0)
 
 # Parametry algorytmu
-raw_signal = []    # Główny sygnał (zielony) do obliczania tętna
-raw_signal_r = []  # Dodatkowa lista dla koloru czerwonego
-raw_signal_g = []  # Dodatkowa lista dla koloru zielonego
-raw_signal_b = []  # Dodatkowa lista dla koloru niebieskiego
-smoothed_box = None
-alpha = 0.15  
+raw_signal = []    # Glowny sygnal (Y/luminancja) do obliczania tetna
+raw_signal_y = []  # Dodatkowa lista dla kanalu Y
+raw_signal_u = []  # Dodatkowa lista dla kanalu U
+raw_signal_v = []  # Dodatkowa lista dla kanalu V
+sample_timestamps = []  # Czas realnie zapisanych probek sygnalu
+smoothed_roi = None
+alpha = 0.15
+
+
+def clamp_roi(x, y, w, h, frame_width, frame_height):
+    x1 = max(0, min(frame_width - 1, int(round(x))))
+    y1 = max(0, min(frame_height - 1, int(round(y))))
+    x2 = max(0, min(frame_width, int(round(x + w))))
+    y2 = max(0, min(frame_height, int(round(y + h))))
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+
+
+def get_forehead_roi(face_landmarks, frame_width, frame_height):
+    landmarks = getattr(face_landmarks, "landmark", face_landmarks)
+    points = np.array([
+        [landmark.x * frame_width, landmark.y * frame_height]
+        for landmark in landmarks
+    ])
+
+    face_x_min, face_y_min = np.min(points, axis=0)
+    face_x_max, face_y_max = np.max(points, axis=0)
+    face_w = face_x_max - face_x_min
+    face_h = face_y_max - face_y_min
+
+    brow_points = points[[70, 63, 105, 66, 107, 336, 296, 334, 293, 300]]
+    brow_center = np.mean(brow_points, axis=0)
+    brow_y = float(np.mean(brow_points[:, 1]))
+
+    forehead_top = points[10]
+    forehead_span = max(8.0, brow_y - forehead_top[1])
+
+    roi_w = 0.36 * face_w
+    roi_h = min(0.36 * face_h, 1 * forehead_span)
+    roi_x = brow_center[0] - roi_w / 2 + 0.03 * face_w
+    roi_y = forehead_top[1] + 0.12 * forehead_span
+
+    brow_margin = 0.22 * forehead_span
+    max_roi_bottom = brow_y - brow_margin
+    if roi_y + roi_h > max_roi_bottom:
+        roi_h = max(6.0, max_roi_bottom - roi_y)
+
+    face_box_top_padding = 0.18 * face_h
+    roi = clamp_roi(roi_x, roi_y, roi_w, roi_h, frame_width, frame_height)
+    face_box = clamp_roi(
+        face_x_min,
+        face_y_min - face_box_top_padding,
+        face_w,
+        face_h + face_box_top_padding,
+        frame_width,
+        frame_height,
+    )
+    return roi, face_box
 
 print("=====================================================")
 print("Kamera uruchomiona. Zbieram sygnał VPG...")
@@ -34,39 +107,41 @@ while True:
         print("Błąd pobierania obrazu.")
         break
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    frame_time = time.time()
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    timestamp_ms = int((frame_time - start_time) * 1000)
+    results = face_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-    if len(faces) > 0:
-        (x, y, w, h) = faces[0]
-        
-        if smoothed_box is None:
-            smoothed_box = [x, y, w, h]
+    if results.face_landmarks:
+        face_landmarks = results.face_landmarks[0]
+        frame_h, frame_w = frame.shape[:2]
+        (fh_x, fh_y, fh_w, fh_h), (sx, sy, sw, sh) = get_forehead_roi(
+            face_landmarks,
+            frame_w,
+            frame_h,
+        )
+
+        roi_now = np.array([fh_x, fh_y, fh_w, fh_h], dtype=float)
+        if smoothed_roi is None:
+            smoothed_roi = roi_now
         else:
-            smoothed_box[0] = alpha * x + (1 - alpha) * smoothed_box[0]
-            smoothed_box[1] = alpha * y + (1 - alpha) * smoothed_box[1]
-            smoothed_box[2] = alpha * w + (1 - alpha) * smoothed_box[2]
-            smoothed_box[3] = alpha * h + (1 - alpha) * smoothed_box[3]
-            
-        sx, sy, sw, sh = [int(v) for v in smoothed_box]
+            smoothed_roi = alpha * roi_now + (1 - alpha) * smoothed_roi
 
-        fh_w = int(0.4 * sw)
-        fh_h = int(0.16 * sh)
-        fh_x = sx + int(0.3 * sw)
-        fh_y = sy + int(0.13 * sh)
+        fh_x, fh_y, fh_w, fh_h = [int(v) for v in smoothed_roi]
 
         roi_color = frame[fh_y:fh_y+fh_h, fh_x:fh_x+fh_w]
         
         if roi_color.size > 0:
-            mean_b = np.mean(roi_color[:, :, 0])
-            mean_g = np.mean(roi_color[:, :, 1])
-            mean_r = np.mean(roi_color[:, :, 2])
+            roi_yuv = cv2.cvtColor(roi_color, cv2.COLOR_BGR2YUV)
+            mean_y, mean_u, mean_v = np.mean(roi_yuv, axis=(0, 1))
             
-            raw_signal_b.append(mean_b)
-            raw_signal_g.append(mean_g)
-            raw_signal_r.append(mean_r)
+            raw_signal_y.append(mean_y)
+            raw_signal_u.append(mean_u)
+            raw_signal_v.append(mean_v)
             
-            raw_signal.append(mean_g)
+            raw_signal.append(mean_y)
+            sample_timestamps.append(frame_time)
         
         cv2.rectangle(frame, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 2)
         cv2.rectangle(frame, (fh_x, fh_y), (fh_x + fh_w, fh_y + fh_h), (0, 255, 0), 2)
@@ -80,10 +155,16 @@ end_time = time.time()
 elapsed_time = end_time - start_time
 
 cap.release()
+face_landmarker.close()
 cv2.destroyAllWindows()
 
-if len(raw_signal) > 100:  
-    actual_fps = len(raw_signal) / elapsed_time 
+if len(raw_signal) > 100:
+    signal_duration = sample_timestamps[-1] - sample_timestamps[0]
+    if signal_duration <= 0:
+        print("Nie udalo sie poprawnie wyznaczyc czasu probek sygnalu.")
+        raise SystemExit(1)
+
+    actual_fps = (len(raw_signal) - 1) / signal_duration
     
     print(f"\nZebrano {len(raw_signal)} próbek w czasie {elapsed_time:.2f} sekund.")
     print(f"Rzeczywisty klatkaż (FPS) wyniósł: {actual_fps:.2f} kl/s. Trwa analiza...")
@@ -92,25 +173,48 @@ if len(raw_signal) > 100:
     data_filename = f"vpg_data_{timestamp}.csv"
     plot_filename = f"vpg_plot_{timestamp}.png"
     
-    np.savetxt(data_filename, raw_signal, delimiter=",", header="Mean_Green_Intensity", comments='')
+    np.savetxt(data_filename, raw_signal, delimiter=",", header="Mean_Y_Luminance", comments='')
     
-    detrended_signal = signal.detrend(raw_signal)
+    raw_signal_array = np.asarray(raw_signal, dtype=float)
+    detrended_signal = signal.detrend(raw_signal_array)
     
-    #GRANICA FILTRA: od 1.0 Hz (odcina wszystko poniżej 60 BPM)
-    b, a = signal.butter(3, [1.0, 4.0], btype='bandpass', fs=actual_fps)
+    min_bpm = 55.0
+    max_bpm = 200.0
+
+    # Pasmo tetna: zostawiamy lekki zapas ponizej 60 BPM, ale bez wpuszczania
+    # bardzo wolnych zmian od oswietlenia i ruchu.
+    b, a = signal.butter(3, [min_bpm / 60.0, max_bpm / 60.0], btype='bandpass', fs=actual_fps)
     filtered_signal = signal.filtfilt(b, a, detrended_signal)
+    time_axis = np.array(sample_timestamps) - sample_timestamps[0]
+    raw_signal_centered = raw_signal_array - np.mean(raw_signal_array)
+    detrended_display = detrended_signal / (np.std(detrended_signal) + 1e-8)
+    filtered_display = filtered_signal / (np.std(filtered_signal) + 1e-8)
     
-    N = len(filtered_signal)
-    yf = np.abs(fft.rfft(filtered_signal))
-    xf = fft.rfftfreq(N, 1/actual_fps)
+    autocorr = signal.correlate(filtered_signal, filtered_signal, mode='full')
+    autocorr = autocorr[len(autocorr) // 2:]
+    autocorr = autocorr / np.max(np.abs(autocorr))
     
-    valid_idx = np.where((xf >= 1.0) & (xf <= 4.0))
-    valid_xf = xf[valid_idx]
-    valid_yf = yf[valid_idx]
+    min_lag = max(1, int(actual_fps / (max_bpm / 60.0)))
+    max_lag = min(len(autocorr) - 1, int(actual_fps / (min_bpm / 60.0)))
+    valid_autocorr = autocorr[min_lag:max_lag + 1]
     
-    if len(valid_yf) > 0:
-        max_idx = np.argmax(valid_yf)
-        heart_rate_hz = valid_xf[max_idx]
+    if len(valid_autocorr) > 0:
+        min_peak_distance = max(1, int(actual_fps * 0.25))
+        peaks, _ = signal.find_peaks(
+            valid_autocorr,
+            distance=min_peak_distance,
+            prominence=0.03,
+        )
+
+        if len(peaks) > 0:
+            peak_values = valid_autocorr[peaks]
+            strong_peak_threshold = 0.75 * np.max(peak_values)
+            strong_peaks = peaks[peak_values >= strong_peak_threshold]
+            best_lag = min_lag + int(strong_peaks[0])
+        else:
+            best_lag = min_lag + int(np.argmax(valid_autocorr))
+
+        heart_rate_hz = actual_fps / best_lag
         heart_rate_bpm = heart_rate_hz * 60.0
         
         print(f"\n=======================================")
@@ -119,32 +223,39 @@ if len(raw_signal) > 100:
         
         plt.figure(figsize=(12, 9))
         
-        # Wykres 1: Analiza składowych RGB
+        # Wykres 1: Analiza skladowych YUV po odjeciu sredniej
         plt.subplot(3, 1, 1)
-        plt.plot(raw_signal_r, color='red', alpha=0.7, label='Czerwony (Red)')
-        plt.plot(raw_signal_g, color='green', alpha=0.7, label='Zielony (Green)')
-        plt.plot(raw_signal_b, color='blue', alpha=0.7, label='Niebieski (Blue)')
-        plt.title("Porównanie surowych sygnałów RGB z czoła")
-        plt.ylabel("Jasność pikseli")
+        y_centered = np.asarray(raw_signal_y) - np.mean(raw_signal_y)
+        u_centered = np.asarray(raw_signal_u) - np.mean(raw_signal_u)
+        v_centered = np.asarray(raw_signal_v) - np.mean(raw_signal_v)
+        plt.plot(time_axis, y_centered, color='black', alpha=0.8, label='Y - srednia')
+        plt.plot(time_axis, u_centered, color='blue', alpha=0.6, label='U - srednia')
+        plt.plot(time_axis, v_centered, color='red', alpha=0.6, label='V - srednia')
+        plt.title("Zmiany kanalow YUV z ROI po odjeciu sredniej")
+        plt.xlabel("Czas [s]")
+        plt.ylabel("Odchylenie od sredniej")
         plt.legend(loc="upper right")
         plt.grid(True)
         
-        # Wykres 2: Detrending dla kanału zielonego
+        # Wykres 2: Kanal Y w skali, w ktorej widac puls
         plt.subplot(3, 1, 2)
-        plt.plot(raw_signal, color='gray', alpha=0.5, label='Surowy kanał zielony')
-        plt.plot(detrended_signal, color='green', label='Po usunięciu trendu')
-        plt.title(f"Sygnał VPG (Kanał Zielony) | Ostateczny wynik: {heart_rate_bpm:.1f} BPM")
-        plt.xlabel("Numer próbki (klatka wideo)")
-        plt.ylabel("Znormalizowana jasność")
+        plt.plot(time_axis, raw_signal_centered, color='gray', alpha=0.45, label='Y - srednia')
+        plt.plot(time_axis, detrended_display, color='green', alpha=0.85, label='Y detrend / std')
+        plt.plot(time_axis, filtered_display, color='red', linewidth=1.4, label='Y po filtrze / std')
+        plt.title(f"Sygnal VPG (kanal Y) | Ostateczny wynik: {heart_rate_bpm:.1f} BPM")
+        plt.xlabel("Czas [s]")
+        plt.ylabel("Odchylenie / wartosc znormalizowana")
         plt.legend(loc="upper right")
         plt.grid(True)
         
-        # Wykres 3: Ostateczne tętno
+        # Wykres 3: Autokorelacja i wybrane tetno
         plt.subplot(3, 1, 3)
-        plt.plot(filtered_signal, color='red', label='Sygnał tętna')
-        plt.title("Wyczyszczony puls (Filtrowanie od 1.0 do 4.0 Hz)")
-        plt.xlabel("Numer próbki (klatka wideo)")
-        plt.ylabel("Amplituda")
+        bpm_axis = (actual_fps / np.arange(min_lag, max_lag + 1)) * 60.0
+        plt.plot(bpm_axis, valid_autocorr, color='red', label='Autokorelacja')
+        plt.axvline(heart_rate_bpm, color='black', linestyle='--', label=f'Pik: {heart_rate_bpm:.1f} BPM')
+        plt.title("Estymacja tetna na podstawie autokorelacji")
+        plt.xlabel("Tetno [BPM]")
+        plt.ylabel("Znormalizowana autokorelacja")
         plt.legend(loc="upper right")
         plt.grid(True)
         
