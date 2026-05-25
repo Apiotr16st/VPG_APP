@@ -7,6 +7,8 @@ class VpgConfig:
     base_dir: str
     face_landmarker_model: str
     display_scale: float = 2.0
+    display_max_width: int = 1280
+    display_max_height: int = 680
     roi_smoothing_alpha: float = 0.15
 
     buffer_size: int = 50

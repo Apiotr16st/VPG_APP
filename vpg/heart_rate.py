@@ -14,8 +14,8 @@ class ChannelState:
     last_eight_second_update_time: float | None = None
     rolling_bpm_buffer: list[float] = field(default_factory=list)
     rolling_bpm_average: float | None = None
-    samples_since_rolling_average_update: int = 0
     bpm_history: list[float] = field(default_factory=list)
+    processed_batch_samples: int = 0
 
 
 def estimate_heart_rate_autocorr(values, timestamps, config):
@@ -93,15 +93,20 @@ def preprocess_for_heart_rate(values, actual_fps, config):
 
 
 def update_channel_state(channel_state, timestamps, config):
-    if len(channel_state.samples) < config.buffer_size:
+    update_eight_second_bpm(channel_state, timestamps, config)
+
+    batch_end = channel_state.processed_batch_samples + config.buffer_size
+    if len(channel_state.samples) < batch_end:
         return
 
-    sample_buffer = channel_state.samples[-config.buffer_size:]
-    timestamp_buffer = timestamps[-config.buffer_size:]
+    batch_start = channel_state.processed_batch_samples
+    sample_buffer = channel_state.samples[batch_start:batch_end]
+    timestamp_buffer = timestamps[batch_start:batch_end]
+    channel_state.processed_batch_samples = batch_end
+
     calc_start = time.perf_counter()
     estimated_bpm = estimate_heart_rate_autocorr(sample_buffer, timestamp_buffer, config)
     channel_state.current_calc_time_ms = (time.perf_counter() - calc_start) * 1000.0
-    update_eight_second_bpm(channel_state, timestamps, config)
 
     if estimated_bpm is None:
         return
@@ -110,13 +115,8 @@ def update_channel_state(channel_state, timestamps, config):
     channel_state.rolling_bpm_buffer.append(estimated_bpm)
     if len(channel_state.rolling_bpm_buffer) > config.rolling_bpm_buffer_size:
         channel_state.rolling_bpm_buffer = channel_state.rolling_bpm_buffer[-config.rolling_bpm_buffer_size:]
-    channel_state.samples_since_rolling_average_update += 1
-    if (
-        len(channel_state.rolling_bpm_buffer) == config.rolling_bpm_buffer_size
-        and channel_state.samples_since_rolling_average_update >= config.rolling_bpm_buffer_size
-    ):
+    if len(channel_state.rolling_bpm_buffer) == config.rolling_bpm_buffer_size:
         channel_state.rolling_bpm_average = float(np.mean(channel_state.rolling_bpm_buffer))
-        channel_state.samples_since_rolling_average_update = 0
 
     channel_state.bpm_history.append(estimated_bpm)
     if len(channel_state.bpm_history) > config.bpm_history_limit:

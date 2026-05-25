@@ -86,7 +86,12 @@ def main():
                 len(y_state.samples),
                 config,
             )
-            display_frame = resize_for_display(dashboard_frame, config.display_scale)
+            display_frame = resize_for_display(
+                dashboard_frame,
+                config.display_scale,
+                config.display_max_width,
+                config.display_max_height,
+            )
             cv2.imshow("VPG Prototyp - Kamera na zywo", display_frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -146,15 +151,19 @@ def process_face_frame(
     return smoothed_roi
 
 
-def resize_for_display(frame, scale):
-    if scale == 1.0:
+def resize_for_display(frame, scale, max_width, max_height):
+    frame_h, frame_w = frame.shape[:2]
+    fit_scale = min(max_width / frame_w, max_height / frame_h)
+    effective_scale = min(scale, fit_scale)
+
+    if effective_scale == 1.0:
         return frame
 
     return cv2.resize(
         frame,
         None,
-        fx=scale,
-        fy=scale,
+        fx=effective_scale,
+        fy=effective_scale,
         interpolation=cv2.INTER_LINEAR,
     )
 
