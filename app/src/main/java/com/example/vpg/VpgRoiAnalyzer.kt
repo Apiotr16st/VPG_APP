@@ -3,15 +3,16 @@ package com.example.vpg
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import kotlin.math.max
 import kotlin.math.min
 
-
 data class VpgResult(val meanY: Float, val meanG: Float, val roiRect: Rect)
+
 class VpgRoiAnalyzer {
 
-    private val roiSmoothingAlpha = 0.15f
+    private val roiSmoothingAlpha = 0.35f
     private var smoothedRoi: FloatArray? = null
 
     fun processFrame(result: FaceLandmarkerResult, bitmap: Bitmap): VpgResult? {
@@ -20,59 +21,73 @@ class VpgRoiAnalyzer {
         val landmarks = result.faceLandmarks()[0]
         val frameW = bitmap.width
         val frameH = bitmap.height
-
         val rawRoi = getForeheadRoiCoordinates(landmarks, frameW, frameH)
 
-        val currentRoi = if (smoothedRoi == null) {
+        val previousRoi = smoothedRoi
+        val currentRoi = if (previousRoi == null) {
             rawRoi
         } else {
             floatArrayOf(
-                roiSmoothingAlpha * rawRoi[0] + (1 - roiSmoothingAlpha) * smoothedRoi!![0],
-                roiSmoothingAlpha * rawRoi[1] + (1 - roiSmoothingAlpha) * smoothedRoi!![1],
-                roiSmoothingAlpha * rawRoi[2] + (1 - roiSmoothingAlpha) * smoothedRoi!![2],
-                roiSmoothingAlpha * rawRoi[3] + (1 - roiSmoothingAlpha) * smoothedRoi!![3]
+                roiSmoothingAlpha * rawRoi[0] + (1.0f - roiSmoothingAlpha) * previousRoi[0],
+                roiSmoothingAlpha * rawRoi[1] + (1.0f - roiSmoothingAlpha) * previousRoi[1],
+                roiSmoothingAlpha * rawRoi[2] + (1.0f - roiSmoothingAlpha) * previousRoi[2],
+                roiSmoothingAlpha * rawRoi[3] + (1.0f - roiSmoothingAlpha) * previousRoi[3],
             )
         }
         smoothedRoi = currentRoi
 
         val rect = clampRoi(currentRoi[0], currentRoi[1], currentRoi[2], currentRoi[3], frameW, frameH)
+        if (rect.width() <= 0 || rect.height() <= 0) return null
 
-        if (rect.width() > 0 && rect.height() > 0) {
-            val means = calculateRoiMeans(bitmap, rect)
-            // ZWRACAMY TERAZ 3 RZECZY: Jasność, Zieleń i dokładny Prostokąt
-            return VpgResult(means.first, means.second, rect)
-        }
-        return null
+        val means = calculateRoiMeans(bitmap, rect)
+        return VpgResult(means.first, means.second, rect)
     }
 
-    private fun getForeheadRoiCoordinates(landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>, frameW: Int, frameH: Int): FloatArray {
-        // Landmark 10 to góra czoła (linia włosów), 151 to środek czoła, 9 to między brwiami
-        val foreheadTop = landmarks[10]
-        val foreheadMid = landmarks[151]
-        val betweenBrows = landmarks[9]
+    private fun getForeheadRoiCoordinates(
+        landmarks: List<NormalizedLandmark>,
+        frameW: Int,
+        frameH: Int,
+    ): FloatArray {
+        var faceXMin = Float.POSITIVE_INFINITY
+        var faceYMin = Float.POSITIVE_INFINITY
+        var faceXMax = Float.NEGATIVE_INFINITY
+        var faceYMax = Float.NEGATIVE_INFINITY
 
-        // Szerokość i wysokość twarzy na podstawie punktów charakterystycznych
-        // 234 i 454 to skrajne punkty kości policzkowych/uszu
-        val faceLeft = landmarks[234].x() * frameW
-        val faceRight = landmarks[454].x() * frameW
-        val faceTop = landmarks[10].y() * frameH
-        val faceBottom = landmarks[152].y() * frameH // 152 to podbródek
+        for (landmark in landmarks) {
+            val x = landmark.x() * frameW
+            val y = landmark.y() * frameH
+            faceXMin = min(faceXMin, x)
+            faceYMin = min(faceYMin, y)
+            faceXMax = max(faceXMax, x)
+            faceYMax = max(faceYMax, y)
+        }
 
-        val faceW = Math.abs(faceRight - faceLeft)
-        val faceH = Math.abs(faceBottom - faceTop)
+        val faceW = max(1.0f, faceXMax - faceXMin)
+        val faceH = max(1.0f, faceYMax - faceYMin)
+        val browIndexes = intArrayOf(70, 63, 105, 66, 107, 336, 296, 334, 293, 300)
 
-        // Wyliczamy wysokość czoła (od linii włosów do brwi)
-        val browY = betweenBrows.y() * frameH
-        val topY = foreheadTop.y() * frameH
-        val foreheadSpan = Math.max(20.0f, browY - topY)
+        var browCenterX = 0.0f
+        var browY = 0.0f
+        for (index in browIndexes) {
+            browCenterX += landmarks[index].x() * frameW
+            browY += landmarks[index].y() * frameH
+        }
+        browCenterX /= browIndexes.size
+        browY /= browIndexes.size
 
-        // Definiujemy ROI na środku czoła
-        val roiW = 0.50f * faceW  // Szerokość: 50% szerokości twarzy
-        val roiH = 0.40f * foreheadSpan // Wysokość: 40% wysokości czoła
+        val foreheadTopY = landmarks[10].y() * frameH
+        val foreheadSpan = max(8.0f, browY - foreheadTopY)
 
-        // Środek czoła (X) i nieco powyżej brwi (Y)
-        val roiX = (foreheadMid.x() * frameW) - (roiW / 2f)
-        val roiY = (foreheadMid.y() * frameH) - (roiH / 2f)
+        val roiW = 0.36f * faceW
+        var roiH = min(0.36f * faceH, foreheadSpan)
+        val roiX = browCenterX - roiW / 2.0f + 0.03f * faceW
+        val roiY = foreheadTopY + 0.12f * foreheadSpan
+
+        val browMargin = 0.22f * foreheadSpan
+        val maxRoiBottom = browY - browMargin
+        if (roiY + roiH > maxRoiBottom) {
+            roiH = max(6.0f, maxRoiBottom - roiY)
+        }
 
         return floatArrayOf(roiX, roiY, roiW, roiH)
     }
@@ -80,8 +95,8 @@ class VpgRoiAnalyzer {
     private fun clampRoi(x: Float, y: Float, w: Float, h: Float, frameW: Int, frameH: Int): Rect {
         val x1 = max(0, min(frameW - 1, Math.round(x)))
         val y1 = max(0, min(frameH - 1, Math.round(y)))
-        val x2 = max(0, min(frameW, Math.round(x + w)))
-        val y2 = max(0, min(frameH, Math.round(y + h)))
+        val x2 = max(0, min(frameW, Math.round(x + max(0.0f, w))))
+        val y2 = max(0, min(frameH, Math.round(y + max(0.0f, h))))
         return Rect(x1, y1, x2, y2)
     }
 

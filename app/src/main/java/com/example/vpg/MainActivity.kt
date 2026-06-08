@@ -4,11 +4,18 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.util.Log
+import android.util.Range
+import android.util.Size
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -20,27 +27,33 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
+    private companion object {
+        const val TARGET_CAMERA_FPS = 30
+        val ANALYSIS_SIZE = Size(480, 640)
+    }
+
     private lateinit var viewFinder: PreviewView
     private lateinit var overlayView: FaceOverlayView
+    private lateinit var bpmText: TextView
     private lateinit var faceLandmarker: FaceLandmarker
-    private lateinit var cameraExecutor: java.util.concurrent.ExecutorService
+    private lateinit var cameraExecutor: ExecutorService
 
     private val roiAnalyzer = VpgRoiAnalyzer()
-
-
     private val heartRateAnalyzer = HeartRateAnalyzer()
 
     private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
+        ActivityResultContracts.RequestPermission(),
     ) { isGranted: Boolean ->
         if (isGranted) {
             setupMediaPipe()
             startCamera()
         } else {
-            Toast.makeText(this, "Brak zgody na kamerę!", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Camera permission denied", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -49,12 +62,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
-        overlayView = findViewById(R.id.overlayView) // Łapiemy "szybę" z XML
+        overlayView = findViewById(R.id.overlayView)
+        bpmText = findViewById(R.id.bpmText)
 
-        cameraExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        cameraExecutor = Executors.newSingleThreadExecutor()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) {
+            == PackageManager.PERMISSION_GRANTED
+        ) {
             setupMediaPipe()
             startCamera()
         } else {
@@ -63,7 +78,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupMediaPipe() {
-        val baseOptions = BaseOptions.builder().setModelAssetPath("face_landmarker.task").build()
+        val baseOptions = BaseOptions.builder()
+            .setModelAssetPath("face_landmarker.task")
+            .build()
         val options = FaceLandmarker.FaceLandmarkerOptions.builder()
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.VIDEO)
@@ -75,35 +92,49 @@ class MainActivity : AppCompatActivity() {
         faceLandmarker = FaceLandmarker.createFromOptions(this, options)
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            val cameraProvider = cameraProviderFuture.get()
 
-            val preview = Preview.Builder().build().also {
+            val fpsRange = Range(TARGET_CAMERA_FPS, TARGET_CAMERA_FPS)
+            val previewBuilder = Preview.Builder()
+            Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                fpsRange,
+            )
+            val preview = previewBuilder.build().also {
                 it.setSurfaceProvider(viewFinder.surfaceProvider)
             }
 
-            val imageAnalyzer = ImageAnalysis.Builder()
+            val imageAnalysisBuilder = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetResolution(android.util.Size(480, 640))
+                .setTargetResolution(ANALYSIS_SIZE)
+            Camera2Interop.Extender(imageAnalysisBuilder).setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                fpsRange,
+            )
+            val imageAnalyzer = imageAnalysisBuilder
                 .build()
                 .also {
-                    it.setAnalyzer(cameraExecutor) { imageProxy ->
+                    it.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
                         processImage(imageProxy)
                     }
                 }
 
-            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalyzer
+                    this,
+                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                    preview,
+                    imageAnalyzer,
                 )
             } catch (exc: Exception) {
-                Log.e("VPG", "Błąd uruchamiania kamery", exc)
+                Log.e("VPG", "Failed to start camera", exc)
+                runOnUiThread { bpmText.text = "BPM: camera unavailable" }
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -118,7 +149,13 @@ class MainActivity : AppCompatActivity() {
                 val matrix = Matrix()
                 matrix.postRotate(rotationDegrees.toFloat())
                 val rotated = Bitmap.createBitmap(
-                    bitmapRaw, 0, 0, bitmapRaw.width, bitmapRaw.height, matrix, true
+                    bitmapRaw,
+                    0,
+                    0,
+                    bitmapRaw.width,
+                    bitmapRaw.height,
+                    matrix,
+                    true,
                 )
                 bitmapRaw.recycle()
                 rotated
@@ -127,58 +164,73 @@ class MainActivity : AppCompatActivity() {
             }
 
             val mpImage = BitmapImageBuilder(bitmap).build()
-            val timestampMs = imageProxy.imageInfo.timestamp / 1000000
-
+            val timestampMs = imageProxy.imageInfo.timestamp / 1_000_000
             val result = faceLandmarker.detectForVideo(mpImage, timestampMs)
 
             if (result.faceLandmarks().isNotEmpty()) {
-                val vpgData = roiAnalyzer.processFrame(result, bitmap)
-
-                if (vpgData != null) {
-                    val screenRect = mapRectToScreen(
-                        vpgData.roiRect,
-                        bitmap.width,
-                        bitmap.height,
-                        overlayView.width,
-                        overlayView.height
-                    )
-
-                    overlayView.updateBoxes(null, screenRect)
-
-                    heartRateAnalyzer.processSamples(System.currentTimeMillis(), vpgData.meanY, vpgData.meanG)
-
-                    val bpmG = heartRateAnalyzer.channelG.rollingBpmAverage
-
-                    if (bpmG != null) {
-                        Log.d("VPG_BPM", "❤️ TĘTNO (Kanał Zielony): ${"%.1f".format(bpmG)} BPM")
-                    } else {
-                        val zebrane = heartRateAnalyzer.channelG.samples.size
-                        Log.d("VPG_BPM", "⏳ Zbieranie pulsu... ($zebrane / 150)")
-                    }
-                }
+                processFaceResult(result, bitmap, timestampMs)
             } else {
                 overlayView.updateBoxes(null, null)
-                Log.d("VPG_SIGNAL", "Szukam twarzy...")
+                runOnUiThread { bpmText.text = "BPM: face not detected" }
+                Log.d("VPG_SIGNAL", "Face not detected")
             }
         } catch (e: Exception) {
-            Log.e("VPG", "Błąd analizy klatki", e)
+            Log.e("VPG", "Frame analysis failed", e)
         } finally {
             bitmap?.recycle()
-            imageProxy.close() // BARDZO WAŻNE: zamykamy klatkę
+            imageProxy.close()
         }
     }
 
+    private fun processFaceResult(
+        result: com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult,
+        bitmap: Bitmap,
+        timestampMs: Long,
+    ) {
+        val vpgData = roiAnalyzer.processFrame(result, bitmap) ?: return
+        val screenRect = mapRectToScreen(
+            vpgData.roiRect,
+            bitmap.width,
+            bitmap.height,
+            overlayView.width,
+            overlayView.height,
+        )
 
-    private fun mapRectToScreen(rect: android.graphics.Rect, imageW: Int, imageH: Int, viewW: Int, viewH: Int): android.graphics.RectF {
+        overlayView.updateBoxes(null, screenRect)
+        heartRateAnalyzer.processSamples(timestampMs, vpgData.meanY, vpgData.meanG)
+
+        val channelG = heartRateAnalyzer.channelG
+        val currentBpm = channelG.currentBpm
+        val averageBpm = channelG.rollingBpmAverage
+        if (currentBpm != null) {
+            val averageText = averageBpm?.let { "%.1f".format(it) } ?: "--"
+            val fpsText = channelG.lastBatchFps?.let { "%.1f".format(it) } ?: "--"
+            val bpmTextValue = "BPM: ${"%.1f".format(currentBpm)} | avg10: $averageText | fps: $fpsText"
+            runOnUiThread { bpmText.text = bpmTextValue }
+            Log.d("VPG_BPM", "Green channel $bpmTextValue")
+        } else {
+            val collectedInBatch = channelG.samples.size - channelG.processedBatchSamples
+            val progressText = "BPM: collecting signal ($collectedInBatch / ${heartRateAnalyzer.bufferSize})"
+            runOnUiThread { bpmText.text = progressText }
+            Log.d("VPG_BPM", progressText)
+        }
+    }
+
+    private fun mapRectToScreen(
+        rect: android.graphics.Rect,
+        imageW: Int,
+        imageH: Int,
+        viewW: Int,
+        viewH: Int,
+    ): android.graphics.RectF {
         val scaleX = viewW.toFloat() / imageW.toFloat()
         val scaleY = viewH.toFloat() / imageH.toFloat()
-        val scale = Math.max(scaleX, scaleY)
+        val scale = maxOf(scaleX, scaleY)
 
         val scaledW = imageW * scale
         val scaledH = imageH * scale
-
-        val dx = (viewW - scaledW) / 2f
-        val dy = (viewH - scaledH) / 2f
+        val dx = (viewW - scaledW) / 2.0f
+        val dy = (viewH - scaledH) / 2.0f
 
         val scaledLeft = rect.left * scale + dx
         val scaledTop = rect.top * scale + dy
@@ -189,7 +241,7 @@ class MainActivity : AppCompatActivity() {
             viewW - scaledRight,
             scaledTop,
             viewW - scaledLeft,
-            scaledBottom
+            scaledBottom,
         )
     }
 
